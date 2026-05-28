@@ -355,6 +355,174 @@ app.get("/api/backups", async (req, res) => {
   }
 });
 
+// API: Search and restore the latest database backup from Google Drive folder "Id34"
+app.post("/api/restore-latest-drive", async (req, res) => {
+  try {
+    const { googleAccessToken } = req.body;
+    if (!googleAccessToken) {
+      res.status(400).json({ success: false, error: "Access token is required to download backups from Google Drive." });
+      return;
+    }
+
+    console.log("Starting Google Drive restore check...");
+
+    // 1. Check if we already have ideas in the server's database.
+    // If we do, we do NOT restore since the requirement specifies retrieving restore only on "no ideas in the database locally" (empty database).
+    const activeCountRows = await allQuery("SELECT COUNT(*) as count FROM ideas WHERE deleted = 0", []);
+    const count = activeCountRows[0]?.count || 0;
+    
+    if (count > 0) {
+      res.json({
+        success: false,
+        restored: false,
+        message: "Restore skipped. Local database is not empty."
+      });
+      return;
+    }
+
+    // 2. Search for the directory "Id34" on Google Drive
+    const qStr = "name='Id34' and mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false";
+    const searchFolderUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(qStr)}`;
+    
+    const folderRes = await fetch(searchFolderUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${googleAccessToken}` }
+    });
+
+    if (!folderRes.ok) {
+      const errText = await folderRes.text();
+      res.status(502).json({ success: false, error: `Google Drive Folder search failed: ${errText}` });
+      return;
+    }
+
+    const folderData: any = await folderRes.json();
+    if (!folderData.files || folderData.files.length === 0) {
+      res.json({
+        success: true,
+        restored: false,
+        message: "No backup folder 'Id34' found in Google Drive."
+      });
+      return;
+    }
+
+    const folderId = folderData.files[0].id;
+
+    // 3. Search for files in this folder, ordered by createdTime descending
+    const ext = useFallback ? "json" : "sqlite";
+    const fileQStr = `'${folderId}' in parents and name contains 'backup_cloud_' and name contains '.${ext}' and trashed=false`;
+    const searchFileUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(fileQStr)}&orderBy=createdTime%20desc&pageSize=1`;
+
+    const fileRes = await fetch(searchFileUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${googleAccessToken}` }
+    });
+
+    if (!fileRes.ok) {
+      const errText = await fileRes.text();
+      res.status(502).json({ success: false, error: `Google Drive File search failed: ${errText}` });
+      return;
+    }
+
+    const fileData: any = await fileRes.json();
+    if (!fileData.files || fileData.files.length === 0) {
+      res.json({
+        success: true,
+        restored: false,
+        message: `No backup files ending in .${ext} found in Google Drive folder 'Id34'.`
+      });
+      return;
+    }
+
+    const targetFile = fileData.files[0];
+    console.log(`Found latest backup in Drive: '${targetFile.name}' (${targetFile.id})`);
+
+    // 4. Download backup file from Google Drive
+    const downloadUrl = `https://www.googleapis.com/drive/v3/files/${targetFile.id}?alt=media`;
+    const downloadRes = await fetch(downloadUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${googleAccessToken}` }
+    });
+
+    if (!downloadRes.ok) {
+      const errText = await downloadRes.text();
+      res.status(502).json({ success: false, error: `Google Drive file download failed: ${errText}` });
+      return;
+    }
+
+    if (useFallback) {
+      // JSON Mode
+      const backupJson: any = await downloadRes.json();
+      if (!backupJson || typeof backupJson !== "object" || !backupJson.ideas) {
+        throw new Error("Invalid or corrupted JSON backup loaded from Drive.");
+      }
+      fallbackDb = {
+        ideas: backupJson.ideas || {},
+        backups_registry: backupJson.backups_registry || []
+      };
+      saveFallbackDb();
+      console.log(`Successfully restored fallback database with ${Object.keys(fallbackDb.ideas).length} records from Google Drive.`);
+    } else {
+      // SQLite3 Mode
+      const arrayBuffer = await downloadRes.arrayBuffer();
+      const fileBuffer = Buffer.from(arrayBuffer);
+
+      if (fileBuffer.length === 0) {
+        throw new Error("Empty binary SQLite3 backup file downloaded from Drive.");
+      }
+
+      // First close the existing SQLite connection safely
+      if (dbInstance) {
+        await new Promise<void>((resolve) => {
+          dbInstance.close((err: any) => {
+            if (err) {
+              console.error("Error closing SQLite connection on restore:", err);
+            }
+            resolve();
+          });
+        });
+      }
+
+      // Overwrite the live SQLite DB file
+      fs.writeFileSync(DB_FILE, fileBuffer);
+
+      // Re-initialize and reconnect
+      const sqlite3Verbose = sqlite3.verbose ? sqlite3.verbose() : sqlite3;
+      await new Promise<void>((resolve, reject) => {
+        dbInstance = new sqlite3Verbose.Database(DB_FILE, (err: any) => {
+          if (err) {
+            reject(err);
+          } else {
+            console.log("Restored SQLite database reconnected successfully.");
+            resolve();
+          }
+        });
+      });
+
+      // Ensure system schema is built
+      initializeSQLiteSchema();
+
+      // Regenerate FTS5 Indexes
+      await new Promise<void>((resolve) => {
+        rebuildFTSIndex(() => resolve());
+      });
+    }
+
+    // 5. Gather ideas list to return
+    const restoredIdeas = await allQuery("SELECT * FROM ideas WHERE deleted = 0", []);
+    console.log(`Database sync restore completed successfully! Restored count: ${restoredIdeas.length}`);
+
+    res.json({
+      success: true,
+      restored: true,
+      message: `Successfully restored database from Google Drive backup '${targetFile.name}'!`,
+      ideas: restoredIdeas
+    });
+  } catch (err: any) {
+    console.error("Google Drive backup restore failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Internal restore failure" });
+  }
+});
+
 // API: Verify Google SSO logged in user email and grant access
 app.post("/api/auth-check", (req, res) => {
   try {
@@ -477,10 +645,142 @@ async function uploadToGoogleDrive(accessToken: string, backupFilename: string, 
   return uploadData;
 }
 
+// Helper: Purge backups exceeding retention count
+async function purgeOldBackups(keepCount: number, googleAccessToken?: string | null): Promise<{ purgedLocal: string[], purgedDriveCount: number, drivePurgeError: string | null }> {
+  try {
+    const limit = keepCount;
+    console.log(`Pruning excess backups. Restricting to maximum of ${limit} latest backups.`);
+
+    // 1. Fetch all local backup entries from registry, ordered by timestamp DESC
+    const backups = await allQuery("SELECT * FROM backups_registry ORDER BY timestamp DESC", []);
+    
+    const purgedLocalFiles: string[] = [];
+    if (backups.length > limit) {
+      const itemsToPurge = backups.slice(limit);
+      for (const item of itemsToPurge) {
+        const filePath = path.join(BACKUP_DIR, item.filename);
+        if (fs.existsSync(filePath)) {
+          try {
+            fs.unlinkSync(filePath);
+          } catch (unlinkErr) {
+            console.error(`Failed to delete local backup file ${item.filename}:`, unlinkErr);
+          }
+        }
+        // Remove from DB registry
+        await runQuery("DELETE FROM backups_registry WHERE filename = ?", [item.filename]);
+        
+        // Also if fallback is active
+        if (useFallback) {
+          fallbackDb.backups_registry = fallbackDb.backups_registry.filter((r) => r.filename !== item.filename);
+          saveFallbackDb();
+        }
+        
+        purgedLocalFiles.push(item.filename);
+      }
+    }
+
+    // 2. Google Drive Backup Purge
+    let purgedDriveFilesCount = 0;
+    let drivePurgeError = null;
+
+    if (googleAccessToken) {
+      try {
+        // Find Google Drive folder "Id34"
+        const qStr = "name='Id34' and mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false";
+        const searchFolderUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(qStr)}`;
+        const folderRes = await fetch(searchFolderUrl, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${googleAccessToken}` }
+        });
+
+        if (folderRes.ok) {
+          const folderData: any = await folderRes.json();
+          if (folderData.files && folderData.files.length > 0) {
+            const folderId = folderData.files[0].id;
+            
+            // Search files inside this folder, ordered by createdTime DESC
+            const ext = useFallback ? "json" : "sqlite";
+            const fileQStr = `'${folderId}' in parents and name contains 'backup_cloud_' and name contains '.${ext}' and trashed=false`;
+            
+            // Since ordering is by createdTime desc, we check our items
+            const searchFileUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(fileQStr)}&orderBy=createdTime%20desc&pageSize=100`;
+            const fileRes = await fetch(searchFileUrl, {
+              method: "GET",
+              headers: { Authorization: `Bearer ${googleAccessToken}` }
+            });
+
+            if (fileRes.ok) {
+              const fileData: any = await fileRes.json();
+              const files = fileData.files || [];
+              if (files.length > limit) {
+                const driveToPurge = files.slice(limit);
+                for (const driveFile of driveToPurge) {
+                  // Delete file from Drive
+                  const deleteUrl = `https://www.googleapis.com/drive/v3/files/${driveFile.id}`;
+                  const deleteRes = await fetch(deleteUrl, {
+                    method: "DELETE",
+                    headers: { Authorization: `Bearer ${googleAccessToken}` }
+                  });
+                  if (deleteRes.ok) {
+                    purgedDriveFilesCount++;
+                  } else {
+                    console.error(`Failed to delete Drive file ${driveFile.name} (${driveFile.id})`);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error("Purging Google Drive backups failed:", err);
+        drivePurgeError = err?.message || "Error communicating with Google Drive during purge";
+      }
+    }
+
+    return {
+      purgedLocal: purgedLocalFiles,
+      purgedDriveCount: purgedDriveFilesCount,
+      drivePurgeError
+    };
+
+  } catch (error: any) {
+    console.error("Pruning process error:", error);
+    return {
+      purgedLocal: [],
+      purgedDriveCount: 0,
+      drivePurgeError: error?.message || "Pruning critical error"
+    };
+  }
+}
+
+// API: Clear old backups exceeding selected limit
+app.post("/api/purge-backups", async (req, res) => {
+  try {
+    const { keepCount, googleAccessToken } = req.body;
+    const limit = parseInt(keepCount, 10);
+    if (isNaN(limit) || limit < 1 || limit > 99) {
+      res.status(400).json({ success: false, error: "Invalid retention count (1-99 expected)." });
+      return;
+    }
+
+    const purgeResult = await purgeOldBackups(limit, googleAccessToken);
+    res.json({
+      success: true,
+      message: `Successfully purged excess backup snapshots! Kept the most recent ${limit} items.`,
+      purgedLocalCount: purgeResult.purgedLocal.length,
+      purgedDriveCount: purgeResult.purgedDriveCount,
+      drivePurgeError: purgeResult.drivePurgeError
+    });
+  } catch (err: any) {
+    console.error("Purge API router error:", err);
+    res.status(500).json({ success: false, error: err?.message || "Internal server error on purge trigger" });
+  }
+});
+
 // API: Binary or JSON snapshot cloud backup execution
 app.post("/api/backup", async (req, res) => {
   try {
-    const { googleAccessToken } = req.body;
+    const { googleAccessToken, keepCount } = req.body;
     const timestamp = new Date().toISOString();
     const safeTimestampString = timestamp.replace(/[:.]/g, "-");
     const activeFile = useFallback ? FALLBACK_DB_FILE : DB_FILE;
@@ -535,6 +835,15 @@ app.post("/api/backup", async (req, res) => {
       }
     }
 
+    // Auto-purge if keepCount is loaded
+    let purgedInfo = null;
+    if (keepCount) {
+      const limit = parseInt(keepCount, 10);
+      if (!isNaN(limit) && limit >= 1 && limit <= 99) {
+        purgedInfo = await purgeOldBackups(limit, googleAccessToken);
+      }
+    }
+
     res.json({
       success: true,
       backup: {
@@ -545,7 +854,8 @@ app.post("/api/backup", async (req, res) => {
       },
       driveSynced: !!googleDriveBackupResult,
       driveFileInfo: googleDriveBackupResult,
-      driveSyncError
+      driveSyncError,
+      purgedInfo
     });
   } catch (err: any) {
     console.error("Cloud snapshot fail:", err);

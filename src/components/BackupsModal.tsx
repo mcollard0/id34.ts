@@ -7,7 +7,8 @@ interface BackupsModalProps {
   isOpen: boolean;
   onClose: () => void;
   backups: CloudBackup[];
-  onTriggerBackup: (googleAccessToken?: string | null) => Promise<boolean>;
+  onTriggerBackup: (googleAccessToken?: string | null, keepCount?: number) => Promise<boolean>;
+  onPurgeBackups: (keepCount: number) => Promise<{ success: boolean; message: string; purgedLocalCount: number; purgedDriveCount: number }>;
   refreshBackups: () => void;
   isSyncing: boolean;
   googleAccessToken?: string | null;
@@ -18,25 +19,38 @@ export const BackupsModal: React.FC<BackupsModalProps> = ({
   onClose,
   backups,
   onTriggerBackup,
+  onPurgeBackups,
   refreshBackups,
   isSyncing,
   googleAccessToken,
 }) => {
   const [backingUp, setBackingUp] = useState(false);
+  const [purging, setPurging] = useState(false);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
+
+  const [keepCount, setKeepCount] = useState<number>(() => {
+    return parseInt(localStorage.getItem("backups_keep_count") || "10", 10);
+  });
+
+  const handleKeepCountChange = (val: number) => {
+    setKeepCount(val);
+    localStorage.setItem("backups_keep_count", String(val));
+    setBackupMessage(`Retention policy updated to keep maximum ${val} snapshots.`);
+    setTimeout(() => setBackupMessage(null), 4000);
+  };
 
   const handleCreateBackup = async () => {
     setBackingUp(true);
     setBackupMessage(null);
     try {
-      const success = await onTriggerBackup(googleAccessToken);
+      const success = await onTriggerBackup(googleAccessToken, keepCount);
       if (success) {
         setBackupMessage(
           googleAccessToken
-            ? "Sync succeeded: Database copy uploaded to Google Drive folder '/Id34/'!"
-            : "SQLite3 database backup saved successfully to local storage."
+            ? `Sync succeeded: Backup uploaded. Enforcing limit (${keepCount}) auto-pruned excess copies!`
+            : `SQLite3 snapshot saved locally. Enforcing limit (${keepCount}) auto-pruned excess copies!`
         );
-        setTimeout(() => setBackupMessage(null), 5000);
+        setTimeout(() => setBackupMessage(null), 6000);
       } else {
         setBackupMessage("Failed to write backup. Check connection or access permissions.");
       }
@@ -44,6 +58,29 @@ export const BackupsModal: React.FC<BackupsModalProps> = ({
       setBackupMessage(`Backup error: ${e?.message || e}`);
     } finally {
       setBackingUp(false);
+    }
+  };
+
+  const handlePurgeClick = async () => {
+    if (!confirm(`Are you sure you want to purge excess backups? This will delete all local snapshots and connected Google Drive files older than your selected limit (${keepCount}).`)) {
+      return;
+    }
+    setPurging(true);
+    setBackupMessage(null);
+    try {
+      const res = await onPurgeBackups(keepCount);
+      if (res.success) {
+        setBackupMessage(
+          `Purge complete! Deleted ${res.purgedLocalCount} local file(s) and ${res.purgedDriveCount} Google Drive snapshot(s).`
+        );
+        refreshBackups();
+      } else {
+        setBackupMessage(`Purge error: ${res.message}`);
+      }
+    } catch (err: any) {
+      setBackupMessage(`Purge failed: ${err?.message || err}`);
+    } finally {
+      setPurging(false);
     }
   };
 
@@ -136,7 +173,7 @@ export const BackupsModal: React.FC<BackupsModalProps> = ({
                     </div>
                     <div>
                       <p className="font-semibold">Google Drive Backup Status</p>
-                      <p className="text-[10px] text-slate-500 mt-0.5">
+                      <p className="text-[10px] text-slate-500 mt-0.5 font-sans leading-relaxed">
                         {googleAccessToken 
                           ? "SSO Linked to Drive. Uploading copies directly to Drive folder /Id34/."
                           : "Google Sign-In active but session token not linked to Drive yet."}
@@ -150,6 +187,55 @@ export const BackupsModal: React.FC<BackupsModalProps> = ({
                     </span>
                   )}
                 </div>
+
+                {/* Retention & Purging Controls block */}
+                <div className="bg-white rounded-xl border border-slate-150 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="space-y-0.5">
+                      <label className="text-xs font-semibold text-slate-700 font-sans block">
+                        Backups Retention Policy
+                      </label>
+                      <span className="text-[10px] text-slate-400 font-sans">
+                        Max number of snapshots to keep before discarding older copies.
+                      </span>
+                    </div>
+
+                    <div className="flex items-center space-x-2">
+                      <select
+                        id="bk-retention-dropdown"
+                        value={keepCount}
+                        onChange={(e) => handleKeepCountChange(parseInt(e.target.value, 10))}
+                        className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-lg px-2.5 py-1.5 focus:ring-1 focus:ring-indigo-500 font-semibold font-sans outline-hidden cursor-pointer"
+                      >
+                        {Array.from({ length: 99 }, (_, j) => j + 1).map((val) => (
+                          <option key={val} value={val}>
+                            {val}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+                    <span className="text-[10px] text-slate-400 font-sans leading-relaxed max-w-[280px]">
+                      Manually discard excess local & Google Drive snapshots exceeding your threshold.
+                    </span>
+                    <button
+                      id="purge-backups-btn"
+                      disabled={purging || isSyncing}
+                      onClick={handlePurgeClick}
+                      className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 disabled:bg-slate-100 text-rose-600 disabled:text-slate-400 border border-rose-200 disabled:border-slate-150 rounded-lg text-[11px] font-bold font-sans flex items-center space-x-1 cursor-pointer transition-all shrink-0"
+                    >
+                      {purging ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <X className="w-3.5 h-3.5 text-rose-500" />
+                      )}
+                      <span>{purging ? "Purging..." : "Purge Backups"}</span>
+                    </button>
+                  </div>
+                </div>
+
               </div>
 
               {/* Main List */}
@@ -225,7 +311,7 @@ export const BackupsModal: React.FC<BackupsModalProps> = ({
               </div>
 
               {/* Informational Panel */}
-              <div className="p-4 bg-slate-50 border-t border-slate-150 text-[10px] text-slate-400 text-center leading-relaxed">
+              <div className="p-4 bg-slate-50 border-t border-slate-150 text-[10px] text-slate-400 text-center leading-relaxed font-sans">
                 By maintaining standard SQLites, copies are 100% binary consistent. Ready for direct restoration on second device.
               </div>
             </motion.div>

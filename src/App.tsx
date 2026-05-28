@@ -47,6 +47,7 @@ export default function App() {
   const [drawerQuery, setDrawerQuery] = useState("");
   const [backups, setBackups] = useState<CloudBackup[]>([]);
   const [inputValidationMsg, setInputValidationMsg] = useState<string | null>(null);
+  const [restoreMessage, setRestoreMessage] = useState<string | null>(null);
 
   // Quick ClientID generation to identify this device
   const clientId = useMemo(() => {
@@ -109,8 +110,14 @@ export default function App() {
         setUser(currentUser);
         const isAllowed = await runAuthCheck(currentUser.email || "", token);
         if (isAllowed) {
-          syncWithServer();
-          fetchBackupList();
+          await syncWithServer();
+          await fetchBackupList();
+
+          const freshCache = localStorage.getItem("captured_ideas");
+          const hasNoLocalData = !freshCache || JSON.parse(freshCache).length === 0;
+          if (hasNoLocalData) {
+            await handleAutoRestore(token);
+          }
         }
         setAuthChecking(false);
       },
@@ -198,8 +205,43 @@ export default function App() {
     return false;
   };
 
+  // 4a. Auto-Restore from Google Drive helper
+  const handleAutoRestore = async (accessToken: string) => {
+    try {
+      setSyncStatus("syncing");
+      console.log("Auto-restore check starting...");
+      const response = await fetch("/api/restore-latest-drive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ googleAccessToken: accessToken })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.restored) {
+          console.log("Restored backup ideas:", data.ideas);
+          setIdeas(data.ideas || []);
+          localStorage.setItem("captured_ideas", JSON.stringify(data.ideas || []));
+          setRestoreMessage(data.message || "Successfully restored your backup from Google Drive!");
+          setSyncStatus("synced");
+          setLastSyncTime(new Date().toLocaleTimeString());
+          await fetchBackupList();
+        } else {
+          console.log("Auto-restore skipped or no backups found:", data.message);
+          setSyncStatus("synced");
+        }
+      } else {
+        console.warn("Auto-restore endpoint error status:", response.status);
+        setSyncStatus("offline");
+      }
+    } catch (err) {
+      console.error("Auto-restore from Google Drive failed:", err);
+      setSyncStatus("offline");
+    }
+  };
+
   // 5. Trigger Single manual/checkpoint backup in Google Cloud Files
-  const handleTriggerCloudBackup = async (tokenInput?: string | null): Promise<boolean> => {
+  const handleTriggerCloudBackup = async (tokenInput?: string | null, keepCount?: number): Promise<boolean> => {
     const token = tokenInput || googleToken;
     try {
       // Force instant sync first to guarantee snapshot is 100% current
@@ -208,7 +250,7 @@ export default function App() {
       const res = await fetch("/api/backup", { 
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ googleAccessToken: token })
+        body: JSON.stringify({ googleAccessToken: token, keepCount })
       });
       if (res.ok) {
         await fetchBackupList();
@@ -220,6 +262,44 @@ export default function App() {
     return false;
   };
 
+  // 5a. Purge oldest backups to match retention number
+  const handlePurgeBackups = async (keepCountValue: number): Promise<{ success: boolean; message: string; purgedLocalCount: number; purgedDriveCount: number }> => {
+    const token = googleToken;
+    try {
+      const res = await fetch("/api/purge-backups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keepCount: keepCountValue, googleAccessToken: token })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        await fetchBackupList();
+        return {
+          success: true,
+          message: data.message || `Deleted older backups. Kept top ${keepCountValue} snapshots.`,
+          purgedLocalCount: data.purgedLocalCount || 0,
+          purgedDriveCount: data.purgedDriveCount || 0
+        };
+      } else {
+        const data = await res.json();
+        return {
+          success: false,
+          message: data.error || "Failed to purge old backups.",
+          purgedLocalCount: 0,
+          purgedDriveCount: 0
+        };
+      }
+    } catch (err: any) {
+      console.error("Failed to run backups purge API:", err);
+      return {
+        success: false,
+        message: err?.message || "Purge operation failed.",
+        purgedLocalCount: 0,
+        purgedDriveCount: 0
+      };
+    }
+  };
+
   const handleSignIn = async () => {
     setAuthChecking(true);
     setAuthErr(null);
@@ -227,7 +307,17 @@ export default function App() {
       const res = await googleSignIn();
       if (res) {
         setUser(res.user);
-        await runAuthCheck(res.user.email || "", res.accessToken);
+        const isAllowed = await runAuthCheck(res.user.email || "", res.accessToken);
+        if (isAllowed) {
+          await syncWithServer();
+          await fetchBackupList();
+
+          const freshCache = localStorage.getItem("captured_ideas");
+          const hasNoLocalData = !freshCache || JSON.parse(freshCache).length === 0;
+          if (hasNoLocalData) {
+            await handleAutoRestore(res.accessToken);
+          }
+        }
       }
     } catch (e: any) {
       setAuthErr(e?.message || "Sign in flow dismissed or errored.");
@@ -417,7 +507,7 @@ export default function App() {
             </div>
             <div>
               <h2 className="font-sans text-xl font-bold text-slate-800">
-                Idea Backup
+                ID34 Backup
               </h2>
               <p className="font-sans text-xs text-slate-400 font-semibold uppercase tracking-wider mt-0.5">
                 SQLite3 + Offline Sync
@@ -466,16 +556,16 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col antialiased">
+    <div className="h-screen h-[100dvh] bg-slate-50 flex flex-col antialiased overflow-hidden">
       {/* 1. Header Navigation Rail */}
-      <header className="fixed top-0 inset-x-0 h-16 bg-white border-b border-slate-150 z-30 px-4 sm:px-6 flex items-center justify-between shadow-2xs">
+      <header className="h-16 bg-white border-b border-slate-150 z-30 px-4 sm:px-6 flex items-center justify-between shadow-2xs shrink-0">
         <div className="flex items-center space-x-3">
           <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-xs">
             <Lightbulb className="w-5 h-5 text-indigo-100" />
           </div>
           <div>
             <h1 className="font-sans text-sm font-bold text-slate-800 tracking-tight leading-none sm:text-base">
-              Idea Backup
+              ID34 Backup
             </h1>
             <p className="font-sans text-[10px] text-slate-400 mt-0.5 font-medium">
               SQLite3 + Offline Sync
@@ -550,9 +640,24 @@ export default function App() {
       </header>
 
       {/* Main Container viewport */}
-      <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 pt-24 pb-36 flex flex-col">
+      <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 pt-6 pb-4 flex flex-col overflow-hidden min-h-0">
+        {restoreMessage && (
+          <div className="w-full max-w-xl mx-auto mb-4 p-4 bg-indigo-50 border border-indigo-150 rounded-2xl flex items-center justify-between text-xs text-indigo-800 leading-relaxed font-sans shadow-xs shrink-0">
+            <div className="flex items-start space-x-3">
+              <Check className="w-4.5 h-4.5 text-indigo-600 shrink-0 mt-0.5 bg-indigo-150 rounded-full p-0.5" />
+              <span>{restoreMessage}</span>
+            </div>
+            <button
+              onClick={() => setRestoreMessage(null)}
+              className="text-indigo-500 hover:text-indigo-700 font-bold ml-4 cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         {/* Top distraction-free retrieval search box */}
-        <div className="w-full max-w-xl mx-auto mb-10">
+        <div className="w-full max-w-xl mx-auto mb-4 shrink-0">
           <div className="relative shadow-xs rounded-2xl bg-white border border-slate-150 focus-within:ring-2 focus-within:ring-indigo-500/20 focus-within:border-indigo-500 transition-all">
             <Search className="w-5 h-5 text-slate-400 absolute left-4.5 top-4" />
             <input
@@ -579,7 +684,7 @@ export default function App() {
 
           {/* SQLite Real-time FTS Search Results Dropdown/Box if query typed */}
           {searchQuery && (
-            <div className="mt-3 bg-white border border-slate-200 rounded-xl shadow-lg max-h-72 overflow-y-auto p-2 space-y-1">
+            <div className="absolute left-1/2 -translate-x-1/2 w-full max-w-xl mt-1.5 bg-white border border-slate-200 rounded-xl shadow-lg max-h-56 overflow-y-auto p-2 space-y-1 z-35">
               <div className="px-3 py-1 text-[10px] font-mono font-bold tracking-wider text-slate-400 uppercase">
                 SQLite3 FTS matching elements ({searchResults.length})
               </div>
@@ -601,8 +706,8 @@ export default function App() {
                      }}
                      className="w-full text-left p-2.5 rounded-lg hover:bg-slate-50 transition-colors flex items-center justify-between text-xs text-slate-700 font-sans cursor-pointer border border-transparent hover:border-slate-100"
                   >
-                    <span className="truncate pr-4 flex-1">{idea.content}</span>
-                    <ChevronRight className="w-3 h-3 text-slate-400 shrink-0" />
+                     <span className="truncate pr-4 flex-1">{idea.content}</span>
+                     <ChevronRight className="w-3 h-3 text-slate-400 shrink-0" />
                   </button>
                 ))
               )}
@@ -611,11 +716,11 @@ export default function App() {
         </div>
 
         {/* Central visual workspace container */}
-        <div id="interactive-workspace" className="flex-1 flex flex-col justify-center">
-          <div className="bg-white rounded-3xl p-6 sm:p-10 border border-slate-150 shadow-xs">
+        <div id="interactive-workspace" className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          <div className="flex-1 bg-white rounded-3xl p-6 sm:p-10 border border-slate-150 shadow-xs flex flex-col min-h-0 overflow-y-auto">
             {/* Quick Metrics display bar */}
             {activeIdeasCount > 0 && (
-              <div className="flex justify-end mb-4">
+              <div className="flex justify-end mb-4 shrink-0">
                 <span className="inline-flex items-center space-x-1.5 px-3 py-1 bg-indigo-50 rounded-full text-[10px] font-mono font-bold uppercase tracking-wider text-indigo-600">
                   <Database className="w-3 h-3" />
                   <span>{activeIdeasCount} Active Ideas Cached</span>
@@ -634,12 +739,12 @@ export default function App() {
       </main>
 
       {/* 2. Persistent bottom distraction-free entry box */}
-      <footer className="fixed bottom-0 inset-x-0 bg-gradient-to-t from-slate-100 via-slate-50/95 to-transparent pt-10 pb-6 px-4 sm:px-6 z-20">
+      <footer className="bg-slate-50 border-t border-slate-150 py-5 px-4 sm:px-6 z-25 shrink-0">
         <div className="max-w-xl mx-auto">
           <form
             id="idea-capture-form"
             onSubmit={handleCaptureIdea}
-            className="flex items-center space-x-2 bg-white rounded-2xl p-2 border border-slate-150 shadow-xl focus-within:ring-2 focus-within:ring-indigo-500/10 focus-within:border-indigo-600 transition-all"
+            className="flex items-center space-x-2 bg-white rounded-2xl p-2 border border-slate-150 shadow-md focus-within:ring-2 focus-within:ring-indigo-500/10 focus-within:border-indigo-600 transition-all"
           >
             <input
               id="bottom-idea-input"
@@ -696,6 +801,7 @@ export default function App() {
         onClose={() => setShowBackups(false)}
         backups={backups}
         onTriggerBackup={handleTriggerCloudBackup}
+        onPurgeBackups={handlePurgeBackups}
         refreshBackups={fetchBackupList}
         isSyncing={syncStatus === "syncing"}
         googleAccessToken={googleToken}
