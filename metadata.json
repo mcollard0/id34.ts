@@ -1,0 +1,6 @@
+{
+  "name": "Idea Backup: SQLite3 + Offline Sync",
+  "description": "Distraction-free idea captures with robust SQLite3 FTS5 indexing, offline tolerance, and secure real-time personal Google Drive backups.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
