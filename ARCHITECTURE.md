@@ -92,3 +92,20 @@ A credentials block in `firebase-applet-config.json` was previously exposed duri
 - **The Solution Implementations**:
   1. Updated `src/auth.ts` to implement a dynamic fallback resolver `metaEnv`. It attempts to load keys from modern client environment configurations (`VITE_FIREBASE_API_KEY`, etc.) first.
   2. Registered all configuration parameters inside `.env.example`. Developers can feed these keys safely inside platform configuration portals without committing cleartext identifiers inside file histories.
+
+---
+
+## ⚠️ Multi-Tenant Shared Database Risk & Isolation Strategy
+
+### 1. Current Architecture Behavior
+- **Single Shared Database**: All invited/authenticated SSO users on the published deployment target currently read from, write to, and synchronize with the **exact same SQLite database file** (`ideas.sqlite` or `ideas_fallback_db.json`). 
+- **No Data Partitioning**: There is no logical row-level partition or tenant segregation currently enforced. Any authenticated user's client-side synchronization will write entries directly into the global tables and fetch the unified set of records from other users.
+
+### 2. Identified Risks
+- **Data Leakage**: Since any user has access to load or synchronize, they will automatically sync and see ideas authored by other users on the shared deployment.
+- **Overlap on Auto-Backups & auto-purges**: Backups are written to a single folder on Google Drive and managed under a single global retention limit. Users could inadvertently overwrite or delete each other's snapshots.
+
+### 3. Mitigation & Future Multi-Tenant Roadmap (Proposed DB Naming)
+To achieve full tenant isolation without introducing massive backend database clusters, the server should adopt an **Isolation-by-Filename** strategy:
+- **Individual User/Group Database Files**: Instead of a global `ideas.sqlite`, the database filename should be derived from the user's validated SSO email address or group ID (e.g., `{email}.sqlite` or `{email}.json` fallback).
+- **Dynamic DB Multi-Instance Connection Pool**: The backend would safely resolve the user's incoming sub-tenancy on every API request via their session/token, connect or mount the correct database file dynamically, deploy the schemas on a per-tenant layout, and commit transactions to that specific user sandbox only.

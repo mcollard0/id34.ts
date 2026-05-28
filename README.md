@@ -25,7 +25,7 @@ Modify variables securely inside your `.env` configuration file:
 
 ```env
 # Google SSO Email Bypass whitelist (bypassed: all successful SSO logins accepted)
-ALLOWED_USERS="mcollard@gmail.com"
+ALLOWED_USERS="user@example.com"
 
 # Google Gemini API key (kept secure, never exposed to user clients)
 GEMINI_API_KEY="AIzaSy..."
